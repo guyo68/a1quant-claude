@@ -1,14 +1,11 @@
 """
 Backtest runner: orchestrates the full pipeline on historical data.
 
-For each bar (candle-by-candle replay):
-  1. Run structure detection up to current bar
-  2. Detect OBs and FVGs, update statuses
-  3. Map liquidity levels
-  4. Compute MTF alignment
-  5. Score any active setups
-  6. If score ≥ threshold, generate a trade entry
-  7. Simulate trade forward, record outcome
+Strategy:
+  1. Pre-compute all structural analysis on the full dataset (O(n)).
+  2. Walk forward bar-by-bar, filtering structures by formed_index < current_bar
+     so no future data leaks into the decision at any point.
+  3. Simulate trades forward from entry bar using simulate_trade().
 """
 
 import logging
@@ -25,32 +22,60 @@ from ..engine.orderblocks import (
 )
 from ..engine.fvg import detect_fvgs, update_fvg_statuses, get_open_fvgs, FVGKind
 from ..engine.liquidity import detect_equal_levels, detect_liquidity_sweeps, LiquidityLevel
-from ..engine.mtf import get_mtf_alignment, resample_ohlcv
+from ..engine.mtf import resample_ohlcv
 from ..engine.scoring import score_setup, AGRADE_THRESHOLD
-from .trades import Trade, TradeDirection, simulate_trade
-from .metrics import compute_metrics, metrics_by_score_band, BacktestMetrics, print_metrics_report
+from ..engine.structure import detect_structure
+from .trades import Trade, TradeDirection, TradeStatus, simulate_trade
+from .metrics import compute_metrics, BacktestMetrics
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class BacktestConfig:
-    rr_ratio: float = 2.0          # take profit = entry + rr_ratio × risk
-    min_score: float = 60.0        # minimum score to enter a trade
-    max_concurrent_trades: int = 1  # max open trades at once
-    swing_n: int = 5               # fractal pivot window
-    atr_multiplier: float = 1.5    # OB displacement threshold
+    rr_ratio: float = 2.0
+    min_score: float = 60.0
+    max_concurrent_trades: int = 1
+    swing_n: int = 5
+    atr_multiplier: float = 1.5
     atr_period: int = 14
-    fvg_min_pips: float = 2.0      # minimum FVG size
+    fvg_min_pips: float = 2.0
     pip_size: float = 0.0001
-    max_bars_in_trade: int = 500   # bars before trade expires
+    max_bars_in_trade: int = 500
     htf: str = "H4"
     itf: str = "H1"
     ltf: str = "M15"
-    # How far back to look for liquidity sweeps (bars)
     sweep_lookback: int = 20
-    # Only trade during specific sessions: None = all sessions
     session_filter: Optional[list[str]] = None
+
+
+def _build_htf_trend_series(df: pd.DataFrame, timeframe: str, swing_n: int) -> pd.Series:
+    """
+    Pre-compute HTF trend at each M1 bar by detecting structure on the resampled
+    frame and forward-filling the trend value down to M1 resolution.
+    Returns a Series indexed like df with Trend enum values.
+    """
+    df_htf = resample_ohlcv(df, timeframe)
+    breaks, _, _ = detect_structure(df_htf, n=swing_n)
+
+    # Build a trend series at HTF resolution
+    htf_trends = pd.Series(Trend.NEUTRAL, index=df_htf.index)
+    current = Trend.NEUTRAL
+    for b in breaks:
+        current = b.trend_after
+        htf_trends.iloc[b.index] = current
+
+    # Forward-fill to every HTF bar, then reindex to M1
+    htf_trends = htf_trends.ffill()
+    # Reindex to M1 frequency and ffill gaps
+    m1_trends = htf_trends.reindex(df.index, method="ffill")
+    m1_trends = m1_trends.ffill().fillna(Trend.NEUTRAL)
+    return m1_trends
+
+
+def _build_itf_trend_series(df: pd.DataFrame, timeframe: str, swing_n: int) -> pd.Series:
+    """Same as _build_htf_trend_series but for ITF."""
+    return _build_htf_trend_series(df, timeframe, swing_n)
 
 
 def run_backtest(
@@ -61,140 +86,131 @@ def run_backtest(
 ) -> tuple[list[Trade], BacktestMetrics]:
     """
     Run a full bar-by-bar backtest on M1 OHLCV data.
+    Pre-computes all structural data once (O(n)), then walks forward.
     Returns (trades, metrics).
-
-    warmup_bars: number of initial bars to skip (needed for indicator warmup).
     """
     if config is None:
         config = BacktestConfig()
 
+    logger.info(f"Starting backtest: {len(df):,} bars, warmup={warmup_bars}")
+
+    # ── Pre-compute everything once ──────────────────────────────────────────
+    logger.info("Pre-computing structure...")
+    sb_full, sw_highs, sw_lows = detect_structure(df, n=config.swing_n)
+
+    logger.info("Pre-computing order blocks...")
+    obs_full = detect_order_blocks(df, sb_full, config.atr_multiplier, config.atr_period)
+    update_order_block_statuses(df, obs_full)
+
+    logger.info("Pre-computing FVGs...")
+    fvgs_full = detect_fvgs(df, config.fvg_min_pips, config.pip_size)
+    update_fvg_statuses(df, fvgs_full)
+
+    logger.info("Pre-computing liquidity levels...")
+    eq_levels = detect_equal_levels(sw_highs, sw_lows, pip_size=config.pip_size)
+    detect_liquidity_sweeps(df, eq_levels, pip_size=config.pip_size)
+
+    logger.info("Pre-computing HTF/ITF trend series...")
+    htf_trends = _build_htf_trend_series(df, config.htf, config.swing_n)
+    itf_trends = _build_itf_trend_series(df, config.itf, config.swing_n)
+    ltf_trends = _build_itf_trend_series(df, config.ltf, config.swing_n)
+
+    # HTF swing range (rolling 20-bar H4 high/low for premium/discount scoring)
+    df_htf = resample_ohlcv(df, config.htf)
+    htf_roll_high = df_htf["high"].rolling(20, min_periods=1).max().reindex(df.index, method="ffill").ffill()
+    htf_roll_low = df_htf["low"].rolling(20, min_periods=1).min().reindex(df.index, method="ffill").ffill()
+
+    # ── Walk-forward simulation ───────────────────────────────────────────────
+    closes = df["close"].values
+    timestamps = df.index
     trades: list[Trade] = []
     trade_counter = 0
     open_trades: list[Trade] = []
 
-    # Pre-compute full structural analysis once (not recalculated per bar for speed)
-    # For walk-forward integrity, we use as_of slicing in MTF but pre-compute
-    # structure on a rolling basis every N bars to balance accuracy and speed.
-    structure_update_interval = 50  # recompute structure every 50 bars
-
-    cached_obs = []
-    cached_fvgs = []
-    cached_liq_levels: list[LiquidityLevel] = []
-    cached_mtf = None
-    cached_swing_high = float("nan")
-    cached_swing_low = float("nan")
-    last_structure_update = 0
-    last_mtf_update = 0
-
-    closes = df["close"].values
-    opens = df["open"].values
-    timestamps = df.index
-
-    logger.info(f"Starting backtest: {len(df):,} bars, warmup={warmup_bars}")
+    logger.info("Walking forward...")
 
     for i in range(warmup_bars, len(df) - 1):
-        df_slice = df.iloc[: i + 1]
-
-        # Recompute structural elements and MTF periodically (not per-bar — O(n²) otherwise)
-        if i - last_structure_update >= structure_update_interval or i == warmup_bars:
-            try:
-                sb, sw_highs, sw_lows = detect_structure(df_slice, n=config.swing_n)
-                cached_obs = detect_order_blocks(df_slice, sb, config.atr_multiplier, config.atr_period)
-                update_order_block_statuses(df_slice, cached_obs)
-                cached_fvgs = detect_fvgs(df_slice, config.fvg_min_pips, config.pip_size)
-                update_fvg_statuses(df_slice, cached_fvgs)
-                eq_levels = detect_equal_levels(sw_highs, sw_lows, pip_size=config.pip_size)
-                detect_liquidity_sweeps(df_slice, eq_levels, pip_size=config.pip_size)
-                cached_liq_levels = eq_levels
-                df_htf_cache = resample_ohlcv(df_slice, config.htf)
-                if len(df_htf_cache) >= 10:
-                    cached_swing_high = float(df_htf_cache["high"].rolling(20, min_periods=1).max().iloc[-1])
-                    cached_swing_low = float(df_htf_cache["low"].rolling(20, min_periods=1).min().iloc[-1])
-                last_structure_update = i
-            except Exception as e:
-                logger.debug(f"Structure update failed at bar {i}: {e}")
-                continue
-
-        if i - last_mtf_update >= structure_update_interval or cached_mtf is None:
-            try:
-                cached_mtf = get_mtf_alignment(
-                    df_slice, timestamps[i],
-                    htf=config.htf, itf=config.itf, ltf=config.ltf,
-                    swing_n=config.swing_n, atr_multiplier=config.atr_multiplier,
-                )
-                last_mtf_update = i
-            except Exception:
-                cached_mtf = None
-
-        # Resolve any open trades
+        # Resolve open trades that may have hit SL/TP
         still_open = []
         for trade in open_trades:
             updated = simulate_trade(trade, df, max_bars=config.max_bars_in_trade)
-            if updated.status.value != "open":
+            if updated.status != TradeStatus.OPEN:
                 trades.append(updated)
                 if verbose:
-                    logger.info(f"Trade {updated.trade_id} closed: {updated.status.value} {updated.pnl_r:.2f}R")
+                    logger.info(f"  T{updated.trade_id} {updated.status.value} {updated.pnl_r:+.2f}R")
             else:
                 still_open.append(updated)
         open_trades = still_open
 
-        # Skip if at max concurrent positions
         if len(open_trades) >= config.max_concurrent_trades:
             continue
 
-        if cached_mtf is None:
+        # HTF trend at this bar (pre-computed, no look-ahead)
+        htf_trend = htf_trends.iloc[i]
+        if htf_trend == Trend.NEUTRAL:
             continue
 
-        mtf = cached_mtf
-
-        if mtf.htf_trend == Trend.NEUTRAL:
-            continue
-
-        direction = "long" if mtf.htf_trend == Trend.BULLISH else "short"
+        direction = "long" if htf_trend == Trend.BULLISH else "short"
         current_price = closes[i]
 
-        # Find best active OB or FVG for entry
-        active_obs = get_fresh_order_blocks(cached_obs, i)
-        active_fvgs = get_open_fvgs(cached_fvgs, i)
+        # Find an OB or FVG that formed before this bar and price is touching
+        active_obs = get_fresh_order_blocks(obs_full, i)
+        active_fvgs = get_open_fvgs(fvgs_full, i)
 
         target_ob = None
         target_fvg = None
         entry_zone_high = None
         entry_zone_low = None
 
-        # Find an OB/FVG that price is currently touching
         for ob in reversed(active_obs):
             if direction == "long" and ob.kind == OBKind.BULLISH and ob.contains(current_price):
                 target_ob = ob
-                entry_zone_high = ob.high
-                entry_zone_low = ob.low
+                entry_zone_high, entry_zone_low = ob.high, ob.low
                 break
             elif direction == "short" and ob.kind == OBKind.BEARISH and ob.contains(current_price):
                 target_ob = ob
-                entry_zone_high = ob.high
-                entry_zone_low = ob.low
+                entry_zone_high, entry_zone_low = ob.high, ob.low
                 break
 
         if target_ob is None:
             for fvg in reversed(active_fvgs):
                 if direction == "long" and fvg.kind == FVGKind.BULLISH and fvg.contains(current_price):
                     target_fvg = fvg
-                    entry_zone_high = fvg.top
-                    entry_zone_low = fvg.bottom
+                    entry_zone_high, entry_zone_low = fvg.top, fvg.bottom
                     break
                 elif direction == "short" and fvg.kind == FVGKind.BEARISH and fvg.contains(current_price):
                     target_fvg = fvg
-                    entry_zone_high = fvg.top
-                    entry_zone_low = fvg.bottom
+                    entry_zone_high, entry_zone_low = fvg.top, fvg.bottom
                     break
 
         if target_ob is None and target_fvg is None:
             continue
 
-        if math.isnan(cached_swing_high) or math.isnan(cached_swing_low):
+        swing_high = float(htf_roll_high.iloc[i])
+        swing_low = float(htf_roll_low.iloc[i])
+        if math.isnan(swing_high) or math.isnan(swing_low):
             continue
-        swing_high = cached_swing_high
-        swing_low = cached_swing_low
+
+        # Build a lightweight MTFContext from pre-computed trend series
+        from ..engine.mtf import MTFContext
+        mtf = MTFContext(
+            htf_trend=htf_trend,
+            itf_trend=itf_trends.iloc[i],
+            ltf_trend=ltf_trends.iloc[i],
+            htf_aligned=htf_trend != Trend.NEUTRAL,
+            itf_aligned=itf_trends.iloc[i] == htf_trend,
+            ltf_aligned=ltf_trends.iloc[i] == htf_trend,
+            alignment_score=sum([
+                htf_trend != Trend.NEUTRAL,
+                itf_trends.iloc[i] == htf_trend,
+                ltf_trends.iloc[i] == htf_trend,
+            ]) / 3.0,
+            htf_timeframe=config.htf,
+            itf_timeframe=config.itf,
+            ltf_timeframe=config.ltf,
+            itf_ob=target_ob if target_ob and target_ob.kind == (OBKind.BULLISH if direction == "long" else OBKind.BEARISH) else None,
+            itf_fvg=target_fvg,
+        )
 
         score = score_setup(
             candle_index=i,
@@ -203,7 +219,7 @@ def run_backtest(
             mtf=mtf,
             ob=target_ob,
             fvg=target_fvg,
-            liquidity_levels=cached_liq_levels,
+            liquidity_levels=eq_levels,
             current_price=current_price,
             swing_high=swing_high,
             swing_low=swing_low,
@@ -212,10 +228,9 @@ def run_backtest(
         if score.total < config.min_score:
             continue
 
-        # Build trade
         if direction == "long":
             entry_price = current_price
-            stop_loss = entry_zone_low - config.pip_size * 2  # 2 pip buffer below zone
+            stop_loss = entry_zone_low - config.pip_size * 2
             risk = entry_price - stop_loss
             take_profit = entry_price + risk * config.rr_ratio
         else:
@@ -240,26 +255,23 @@ def run_backtest(
             setup_score=score.total,
             setup_notes=score.notes,
         )
-
         open_trades.append(trade)
 
         if verbose:
             logger.info(
-                f"Trade {trade.trade_id} {direction.upper()} @ {entry_price:.5f} "
+                f"  T{trade.trade_id} {direction.upper()} @ {entry_price:.5f} "
                 f"SL={stop_loss:.5f} TP={take_profit:.5f} Score={score.total:.1f}"
             )
 
-    # Close any remaining open trades at end of data
+    # Expire remaining open trades at end of data
+    final_idx = len(df) - 1
     for trade in open_trades:
-        final_idx = len(df) - 1
         trade.exit_index = final_idx
         trade.exit_timestamp = timestamps[final_idx]
         trade.exit_price = closes[final_idx]
         pnl_pips = (trade.exit_price - trade.entry_price) * (1 if trade.direction == TradeDirection.LONG else -1)
         trade.pnl_r = (pnl_pips / trade.risk_pips) if trade.risk_pips > 0 else 0.0
-        from .trades import TradeStatus
         trade.status = TradeStatus.EXPIRED
         trades.append(trade)
 
-    metrics = compute_metrics(trades)
-    return trades, metrics
+    return trades, compute_metrics(trades)

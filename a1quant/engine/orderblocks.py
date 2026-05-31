@@ -90,12 +90,15 @@ def detect_order_blocks(
 
         # Upward break → look for bullish OB (last bearish candle before displacement)
         if sb.broken_level < closes[brk_idx]:
-            displacement = closes[brk_idx] - opens[brk_idx]
+            # Measure full impulse: from the lowest low in the lookback window to BOS close
+            lookback_start = max(brk_idx - 20, 0)
+            impulse_low = float(np.min(lows[lookback_start : brk_idx + 1]))
+            displacement = closes[brk_idx] - impulse_low
             if displacement < atr_multiplier * atr_val:
                 continue
             # Find last bearish candle before brk_idx
             ob_idx = None
-            for j in range(brk_idx - 1, max(brk_idx - 20, 0) - 1, -1):
+            for j in range(brk_idx - 1, lookback_start - 1, -1):
                 if closes[j] < opens[j]:  # bearish candle
                     ob_idx = j
                     break
@@ -113,11 +116,13 @@ def detect_order_blocks(
 
         # Downward break → look for bearish OB (last bullish candle before displacement)
         else:
-            displacement = opens[brk_idx] - closes[brk_idx]
+            lookback_start = max(brk_idx - 20, 0)
+            impulse_high = float(np.max(highs[lookback_start : brk_idx + 1]))
+            displacement = impulse_high - closes[brk_idx]
             if displacement < atr_multiplier * atr_val:
                 continue
             ob_idx = None
-            for j in range(brk_idx - 1, max(brk_idx - 20, 0) - 1, -1):
+            for j in range(brk_idx - 1, lookback_start - 1, -1):
                 if closes[j] > opens[j]:  # bullish candle
                     ob_idx = j
                     break
