@@ -16,3 +16,4 @@ a1quant/data/cot/
 .pytest_cache/
 .coverage
 htmlcov/
+energy.db
